@@ -53,7 +53,7 @@ impl McpClient for Codex {
                 return Err(error);
             }
         };
-        let rendered = render_entry(entry);
+        let mut rendered = render_entry(entry);
         let servers = root
             .entry("mcp_servers")
             .or_insert_with(|| {
@@ -76,6 +76,16 @@ impl McpClient for Codex {
 
         if config_path.exists() {
             back_up(&config_path, &backup_path)?;
+        }
+        if let (Some(previous), Some(replacement)) = (
+            servers.get(&entry.name).and_then(Item::as_table),
+            rendered.as_table_mut(),
+        ) {
+            // Preserve the block's comments and position among unrelated tables.
+            *replacement.decor_mut() = previous.decor().clone();
+            if let Some(position) = previous.position() {
+                replacement.set_position(position);
+            }
         }
         servers.insert(&entry.name, rendered);
         let serialized = root.to_string();
@@ -348,5 +358,41 @@ mod tests {
         );
         let backup = fs::read_to_string(backup_path_for(&config)).unwrap();
         assert!(backup.contains("[mcp_servers.localmem]"));
+    }
+
+    #[test]
+    fn updating_entry_preserves_surrounding_tables() {
+        let home = tempdir().unwrap();
+        let config = Codex.config_path(home.path());
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let before = concat!(
+            "# Settings\nmodel = 'gpt-5'\n\n",
+            "[mcp_servers.other]\ncommand = 'other-server'\n\n",
+            "[profiles.work]\nmodel = 'work-model'\n",
+        );
+        let block = "\n# LocalMem settings\n[mcp_servers.localmem]\ncommand = 'old-command'\n";
+        let after = "\n# Another profile\n[profiles.personal]\nmodel = 'personal-model'\n";
+        let original = format!("{before}{block}{after}");
+        fs::write(&config, &original).unwrap();
+
+        Codex.install(home.path(), &entry()).unwrap();
+
+        let installed = fs::read_to_string(&config).unwrap();
+        assert!(installed.starts_with(before), "{installed}");
+        assert!(installed.ends_with(after), "{installed}");
+        assert_eq!(
+            read_config(&config).unwrap()["mcp_servers"]["localmem"]["command"].as_str(),
+            Some(entry().command.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&config)).unwrap(),
+            original
+        );
+        assert!(installed.contains("# LocalMem settings\n[mcp_servers.localmem]"));
+        assert!(Codex.uninstall(home.path()).unwrap());
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            format!("{before}{after}")
+        );
     }
 }
