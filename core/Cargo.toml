@@ -95,6 +95,8 @@ futures = "0.3"
 
 # TOML config loader (T-46). Reads `<home>/config.toml`.
 toml = "0.8"
+# Format-preserving edits to the Codex config owned by the user.
+toml_edit = "0.22.27"
 
 # Synchronous HTTP client used by:
 #   - dev: tests download the BGE-small ONNX assets from HuggingFace.

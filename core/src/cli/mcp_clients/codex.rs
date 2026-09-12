@@ -10,7 +10,7 @@ use super::{
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml::{Table, Value};
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 pub struct Codex;
 
@@ -31,7 +31,7 @@ impl McpClient for Codex {
         let root = read_config(&path)?;
         Ok(root
             .get("mcp_servers")
-            .and_then(Value::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|servers| servers.get("localmem"))
             .is_some())
     }
@@ -56,11 +56,18 @@ impl McpClient for Codex {
         let rendered = render_entry(entry);
         let servers = root
             .entry("mcp_servers")
-            .or_insert_with(|| Value::Table(Table::new()))
-            .as_table_mut()
+            .or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            })
+            .as_table_like_mut()
             .context("`mcp_servers` must be a TOML table")?;
 
-        if servers.get(&entry.name) == Some(&rendered) {
+        if servers
+            .get(&entry.name)
+            .is_some_and(|server| matches_entry(server, entry))
+        {
             return Ok(InstallReceipt {
                 config_path,
                 backup_path,
@@ -70,8 +77,8 @@ impl McpClient for Codex {
         if config_path.exists() {
             back_up(&config_path, &backup_path)?;
         }
-        servers.insert(entry.name.clone(), rendered);
-        let serialized = toml::to_string_pretty(&root).context("serialize Codex MCP config")?;
+        servers.insert(&entry.name, rendered);
+        let serialized = root.to_string();
         write_config_text_atomic(&config_path, &serialized, "config.toml")?;
 
         Ok(InstallReceipt {
@@ -88,13 +95,13 @@ impl McpClient for Codex {
         let mut root = read_config(&config_path)?;
         let removed = root
             .get_mut("mcp_servers")
-            .and_then(Value::as_table_mut)
+            .and_then(Item::as_table_like_mut)
             .map(|servers| servers.remove("localmem").is_some())
             .unwrap_or(false);
         if removed {
             let backup_path = backup_path_for(&config_path);
             back_up(&config_path, &backup_path)?;
-            let serialized = toml::to_string_pretty(&root).context("serialize Codex MCP config")?;
+            let serialized = root.to_string();
             write_config_text_atomic(&config_path, &serialized, "config.toml")?;
         }
         Ok(removed)
@@ -112,16 +119,13 @@ fn back_up(config_path: &Path, backup_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_config(path: &Path) -> Result<Table> {
+fn read_config(path: &Path) -> Result<DocumentMut> {
     if !path.exists() {
-        return Ok(Table::new());
+        return Ok(DocumentMut::new());
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read existing config at {}", path.display()))?;
-    if raw.trim().is_empty() {
-        return Ok(Table::new());
-    }
-    toml::from_str(&raw).with_context(|| {
+    raw.parse().with_context(|| {
         format!(
             "parse existing config at {} as TOML (refusing to clobber a malformed file)",
             path.display()
@@ -129,24 +133,65 @@ fn read_config(path: &Path) -> Result<Table> {
     })
 }
 
-fn render_entry(entry: &McpServerEntry) -> Value {
+fn render_entry(entry: &McpServerEntry) -> Item {
     let mut server = Table::new();
-    server.insert("command".into(), Value::String(entry.command.clone()));
+    server.insert("command", value(&entry.command));
     if !entry.args.is_empty() {
-        server.insert(
-            "args".into(),
-            Value::Array(entry.args.iter().cloned().map(Value::String).collect()),
-        );
+        let mut args = Array::new();
+        for arg in &entry.args {
+            args.push(arg.as_str());
+        }
+        server.insert("args", value(args));
     }
     if !entry.env.is_empty() {
-        let env = entry
-            .env
-            .iter()
-            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-            .collect();
-        server.insert("env".into(), Value::Table(env));
+        let mut env = Table::new();
+        for (key, val) in &entry.env {
+            env.insert(key, value(val));
+        }
+        server.insert("env", Item::Table(env));
     }
-    Value::Table(server)
+    Item::Table(server)
+}
+
+// Compare values rather than TOML decoration so an equivalent user-formatted
+// entry remains a no-op and does not overwrite the original backup.
+fn matches_entry(server: &Item, entry: &McpServerEntry) -> bool {
+    let Some(server) = server.as_table_like() else {
+        return false;
+    };
+    let expected_len = 1 + usize::from(!entry.args.is_empty()) + usize::from(!entry.env.is_empty());
+    if server.len() != expected_len
+        || server.get("command").and_then(Item::as_str) != Some(entry.command.as_str())
+    {
+        return false;
+    }
+    if !entry.args.is_empty() {
+        let Some(args) = server.get("args").and_then(Item::as_array) else {
+            return false;
+        };
+        if args.len() != entry.args.len()
+            || !args
+                .iter()
+                .zip(&entry.args)
+                .all(|(a, b)| a.as_str() == Some(b.as_str()))
+        {
+            return false;
+        }
+    }
+    if !entry.env.is_empty() {
+        let Some(env) = server.get("env").and_then(Item::as_table_like) else {
+            return false;
+        };
+        if env.len() != entry.env.len()
+            || !entry
+                .env
+                .iter()
+                .all(|(key, val)| env.get(key).and_then(Item::as_str) == Some(val.as_str()))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -162,6 +207,62 @@ mod tests {
             args: vec!["/opt/localmem/mcp-server/src/index.ts".into()],
             env: BTreeMap::from([("LOCALMEM_CORE_URL".into(), "http://127.0.0.1:7788".into())]),
         }
+    }
+
+    #[test]
+    fn install_and_uninstall_preserve_comments_and_key_order() {
+        for original in [
+            "# My Codex settings\nmodel = 'gpt-5' # preferred model\n\n# Keep approval policy\napproval_policy = \"on-request\"\n\n[mcp_servers.other]\n# Other server settings\ncommand = 'other-server'\nargs = [ 'one', 'two' ] # retain spacing\n",
+            "# My Codex settings\nmodel = 'gpt-5'\napproval_policy = 'on-request'\n",
+            "# Empty config with a comment\n\n",
+        ] {
+            let home = tempdir().unwrap();
+            let config = Codex.config_path(home.path());
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, original).unwrap();
+
+            Codex.install(home.path(), &entry()).unwrap();
+            let installed = fs::read_to_string(&config).unwrap();
+            // Even a comment-only document retains all of its original bytes.
+            assert!(installed.contains(original), "{installed}");
+            assert!(Codex.is_installed(home.path()).unwrap());
+            let backup = fs::read(backup_path_for(&config)).unwrap();
+            Codex.install(home.path(), &entry()).unwrap();
+            assert_eq!(fs::read_to_string(&config).unwrap(), installed);
+            assert_eq!(fs::read(backup_path_for(&config)).unwrap(), backup);
+
+            assert!(Codex.uninstall(home.path()).unwrap());
+            assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn equivalent_user_formatted_entry_is_a_no_op() {
+        let home = tempdir().unwrap();
+        let config = Codex.config_path(home.path());
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "# Keep this formatting\n[mcp_servers.localmem]\nargs = [ '/opt/localmem/mcp-server/src/index.ts' ] # entry point\ncommand = '/usr/local/bin/bun'\nenv = { LOCALMEM_CORE_URL = 'http://127.0.0.1:7788' }\n";
+        fs::write(&config, original).unwrap();
+        Codex.install(home.path(), &entry()).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        assert!(!backup_path_for(&config).exists());
+    }
+
+    #[test]
+    fn inline_servers_remain_valid_through_install_and_uninstall() {
+        let home = tempdir().unwrap();
+        let config = Codex.config_path(home.path());
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "mcp_servers = { other = { command = 'other' } }\n").unwrap();
+        Codex.install(home.path(), &entry()).unwrap();
+        assert!(Codex.is_installed(home.path()).unwrap());
+        Codex.install(home.path(), &entry()).unwrap();
+        assert!(Codex.uninstall(home.path()).unwrap());
+        let parsed = read_config(&config).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
     }
 
     #[test]
